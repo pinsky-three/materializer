@@ -8,232 +8,270 @@ import os
 import logging
 import re # Import re for the original error context, though not used in fix
 import traceback # Import traceback for detailed error checking
+from typing import List, Tuple, Optional, NamedTuple, Any
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(asctime)s: %(message)s')
 logger = logging.getLogger(__name__)
 
+# Constants
+RESIZE_DIM = (150, 150)
+KMEANS_CLUSTERS = 5
+KMEANS_MAX_ITER = 100
+KMEANS_N_INIT = 3
+KMEANS_BATCH_SIZE = 1024
+KMEANS_MAX_NO_IMPROVEMENT = 10
+CANVAS_PADDING = 100
+FINAL_PADDING = 500
+OUTPUT_DIR = "result"
+DATA_DIR = "data"
+SUPPORTED_EXTENSIONS = (".jpg", ".jpeg", ".tif", ".tiff", ".png")
 
-def process_image(image_path: str):
+
+# --- Result Types ---
+class ImageLoadResult(NamedTuple):
+    image: Optional[Image.Image] = None
+    warning: Optional[str] = None
+    error: Optional[Exception] = None
+
+    @property
+    def success(self) -> bool:
+        return self.image is not None and self.error is None
+
+
+class ColorResult(NamedTuple):
+    colors: Optional[List[Tuple[int, int, int, int]]] = None
+    error: Optional[Exception] = None
+
+    @property
+    def success(self) -> bool:
+        return self.colors is not None and self.error is None
+
+
+def process_image(image_path: str) -> bool:
+    """Processes a single image: load, find colors, create padded version, save."""
+    logger.debug(f"Attempting to process: {image_path}")
+
+    # 1. Load and Convert Image
+    load_result = load_convert_image(image_path)
+
+    match load_result:
+        case ImageLoadResult(success=True, image=im, warning=warn_msg):
+            if warn_msg:
+                logger.warning(f"{warn_msg} - Image: {image_path}")
+            logger.info(f"Successfully loaded image {image_path}: {im.size}")
+            # Proceed to color extraction
+
+        case ImageLoadResult(success=False, error=err):
+            logger.error(f"Failed to load/convert image {image_path}: {err}", exc_info=isinstance(err, Exception))
+            return False # Indicate failure
+
+        case _: # Catch unexpected cases
+             logger.error(f"Unexpected result from load_convert_image for {image_path}")
+             return False
+
+    # 2. Extract Dominant Colors (only if load succeeded)
+    color_result = extract_dominant_colors(im) # type: ignore <im is guaranteed to be non-None here>
+
+    match color_result:
+        case ColorResult(success=True, colors=palette):
+             if not palette: # Should be caught by error handling, but double-check
+                  logger.error(f"Color extraction returned success but no palette for {image_path}")
+                  return False
+             logger.debug(f"Extracted palette for {image_path} (showing top 1): {palette[0]}")
+             # Proceed to image manipulation
+
+        case ColorResult(success=False, error=err):
+            logger.error(f"Failed to extract dominant colors for {image_path}: {err}", exc_info=isinstance(err, Exception))
+            return False # Indicate failure
+
+        case _: # Catch unexpected cases
+            logger.error(f"Unexpected result from extract_dominant_colors for {image_path}")
+            return False
+
+    # 3. Image Manipulation (only if load and color extraction succeeded)
     try:
-        # Open the image first
-        with Image.open(image_path) as im_raw:
-            exif_error_occurred = False
-            try:
-                # Explicitly load data which triggers exif processing where the error might occur
-                im_raw.load()
-            except TypeError as e:
-                # Check if it's the specific error from re.sub in exif_transpose
-                tb_str = "".join(traceback.format_tb(e.__traceback__))
-                if "expected string or bytes-like object, got 'tuple'" in str(e) and 're/__init__.py' in tb_str and 'exif_transpose' in tb_str:
-                    logger.warning(f"Problematic EXIF data encountered in {image_path}: {e}. Attempting to proceed without transposition.")
-                    exif_error_occurred = True # Mark that the specific error happened
-                    # Do NOT return yet, try converting anyway in the next step
-                else:
-                    # It's a different TypeError during load, treat as fatal for this image
-                    logger.error(f"An unexpected TypeError occurred while loading {image_path}: {e}")
-                    return # Skip this image
+        # Use the second most common color as background, or first if only one exists
+        background_color = palette[1] if len(palette) > 1 else palette[0] # type: ignore <palette is guaranteed non-empty list>
+        logger.debug(f"Using background color: {background_color} for {image_path}")
 
-            # Now, outside the inner try-except for load(), try converting
-            # This might still fail if the internal state is bad after the EXIF error
-            im = im_raw.convert("RGBA")
-            if exif_error_occurred:
-                 logger.info(f"Successfully converted {image_path} despite earlier EXIF TypeError.")
+        x, y = im.size # type: ignore <im is guaranteed non-None>
+        canvas_size = (x + 2 * CANVAS_PADDING, y + 2 * CANVAS_PADDING)
+        canvas = Image.new("RGBA", canvas_size, (0, 0, 0, 0)) # Transparent canvas
+        # Use alpha mask (im) only if the image has alpha channel ('RGBA')
+        paste_mask = im if im.mode == 'RGBA' else None # type: ignore
+        canvas.paste(im, (CANVAS_PADDING, CANVAS_PADDING), mask=paste_mask)
+
+        w, h = canvas.size
+        final_side = max(w, h) + FINAL_PADDING
+        final_image = Image.new("RGBA", (final_side, final_side), background_color)
+
+        offset_x, offset_y = (final_side - w) // 2, (final_side - h) // 2
+        final_image.paste(canvas, (offset_x, offset_y), mask=canvas) # Use canvas alpha
 
     except Exception as e:
-        # Handle errors during open, the convert call above, or other unexpected issues
-        # Log with traceback for better debugging
-        logger.error(f"Failed to process image {image_path}: {e}", exc_info=True)
-        return # Skip this image
+        logger.error(f"Error during image manipulation for {image_path}: {e}", exc_info=True)
+        return False
 
-    # --- If loading and converting succeeded (potentially with EXIF warning) ---
-    logger.info(f"Processing image {image_path} : {im.size}")
-
-    palette = dominant_colors(im)
-
-    if not palette:
-        logger.warning(f"Could not determine dominant colors for {image_path}. Skipping.")
-        return
-
-    # Use the second most common color as background (index 1)
-    # Make sure palette has at least 2 colors, otherwise use the first or a default
-    if len(palette) > 1:
-        background_color = palette[1]
-    elif palette: # Only one color found
-         background_color = palette[0]
-    else: # Should not happen due to check above, but as fallback
-        background_color = (128, 128, 128, 255) # Default gray
-    logger.debug(f"Using background color: {background_color}")
-
-    x, y = im.size
-    pad = 100
-
-    size = (x + 2 * pad, y + 2 * pad)
-
-    # Create canvas with a transparent background initially
-    canvas = Image.new("RGBA", size, (0, 0, 0, 0))
-    # Paste the image onto the transparent canvas
-    # Use alpha mask (im) only if the image has alpha channel ('RGBA')
-    canvas.paste(im, (pad, pad), im if im.mode == 'RGBA' else None)
-
-    w, h = canvas.size
-    # Make padding around the canvas larger
-    side = max(w, h) + 500
-
-    # Create final image with the chosen background color
-    final = Image.new("RGBA", (side, side), background_color)
-
-    # Calculate position to center the canvas on the final image
-    offset_x, offset_y = (side - w) // 2, (side - h) // 2
-    # Paste the canvas (with the image) onto the final background
-    # Use the canvas's alpha channel as the mask to handle transparency correctly
-    final.paste(canvas, (offset_x, offset_y), canvas)
-
-
-    # Calculate relative path from 'data' dir to preserve structure in 'result'
+    # 4. Save Result
     try:
-        relative_path = os.path.relpath(image_path, "data")
-    except ValueError:
-        # Handle cases where image_path might not be under "data" if script usage changes
-        logger.warning(f"Could not determine relative path for {image_path} from 'data'. Using base name.")
-        relative_path = os.path.basename(image_path)
+        relative_path = os.path.relpath(image_path, DATA_DIR)
+        result_dir = os.path.join(OUTPUT_DIR, os.path.dirname(relative_path))
+        result_filename = os.path.splitext(os.path.basename(image_path))[0] + "_result.png"
+        result_path = os.path.join(result_dir, result_filename)
 
-    result_dir = os.path.join("result", os.path.dirname(relative_path))
-    result_filename = os.path.splitext(os.path.basename(image_path))[0] + "_result.png"
-    result_path = os.path.join(result_dir, result_filename)
+        os.makedirs(result_dir, exist_ok=True)
+        logger.info(f"Saving result to {result_path}")
+        final_image.save(result_path, format="PNG") # Explicitly specify format
+        return True # Indicate success
 
-    os.makedirs(result_dir, exist_ok=True)
-    logger.info(f"Saving result to {result_path}")
-    final.save(result_path)
+    except ValueError: # Handles case where image_path might not be under DATA_DIR
+        logger.warning(f"Could not determine relative path for {image_path} from '{DATA_DIR}'. Attempting to save in '{OUTPUT_DIR}' root.")
+        try:
+            result_filename = os.path.splitext(os.path.basename(image_path))[0] + "_result.png"
+            result_path = os.path.join(OUTPUT_DIR, result_filename)
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            logger.info(f"Saving result to {result_path}")
+            final_image.save(result_path, format="PNG")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save result for {image_path} even in root: {e}", exc_info=True)
+            return False
+    except Exception as e:
+        logger.error(f"Failed to save result {result_path}: {e}", exc_info=True)
+        return False
 
 
-# dominant_colors function enhanced for robustness
-def dominant_colors(image: Image):
+def load_convert_image(image_path: str) -> ImageLoadResult:
+    """Opens, loads, and converts an image to RGBA, handling potential errors."""
     try:
-        # Ensure image has data and is RGB(A)
-        image.load()
+        with Image.open(image_path) as im_raw:
+            exif_warning_msg: Optional[str] = None
+            try:
+                # Explicitly load data which triggers exif processing
+                im_raw.load()
+            except TypeError as e:
+                tb_str = "".join(traceback.format_tb(e.__traceback__))
+                # Check if it's the specific recoverable EXIF error
+                if "expected string or bytes-like object, got 'tuple'" in str(e) and 're/__init__.py' in tb_str and 'exif_transpose' in tb_str:
+                    exif_warning_msg = f"Problematic EXIF data: {e}. Proceeding without automatic transposition."
+                else:
+                    # Different, likely fatal, TypeError during load
+                    logger.debug(f"Non-EXIF TypeError during load for {image_path}", exc_info=True)
+                    return ImageLoadResult(error=e)
+            except Exception as e:
+                 # Other error during load
+                 logger.debug(f"Exception during load for {image_path}", exc_info=True)
+                 return ImageLoadResult(error=e)
+
+            # Try converting, potentially after recoverable EXIF error
+            im = im_raw.convert("RGBA")
+            return ImageLoadResult(image=im, warning=exif_warning_msg)
+
+    except FileNotFoundError:
+        # Error during Image.open or .convert
+        logger.debug(f"File not found: {image_path}")
+        return ImageLoadResult(error=FileNotFoundError(f"File not found: {image_path}"))
+    except Exception as e:
+        # Error during Image.open or .convert
+        logger.debug(f"Exception during open/convert for {image_path}", exc_info=True)
+        return ImageLoadResult(error=e)
+
+
+def extract_dominant_colors(image: Image.Image) -> ColorResult:
+    """Extracts dominant colors using KMeans clustering."""
+    try:
         if image.mode not in ['RGB', 'RGBA']:
             image_rgb = image.convert('RGB')
         else:
             image_rgb = image
 
-        # Resize for performance
-        image_small = image_rgb.resize((150, 150), resample=Image.Resampling.NEAREST) # Use explicit resampling
+        # Use LANCZOS for potentially better resize quality
+        image_small = image_rgb.resize(RESIZE_DIM, resample=Image.Resampling.LANCZOS)
+        ar = asarray(image_small)
 
-        ar = asarray(image_small) # Should be 3 channels now
-
-        # Handle cases like fully transparent images becoming 1x1 or similar edge cases
         if ar.size == 0 or ar.shape[0] * ar.shape[1] == 0:
-             logger.warning("Image array is empty or invalid after processing. Returning empty palette.")
-             return []
+             return ColorResult(error=ValueError("Image array is empty or invalid after processing."))
 
         # Ensure we only use RGB for clustering
-        if ar.shape[2] == 4: # If RGBA came through somehow
+        if ar.shape[2] == 4:
              ar = ar[:, :, :3]
         elif ar.shape[2] != 3:
-             logger.warning(f"Unexpected array shape {ar.shape}. Returning empty palette.")
-             return []
-
+             return ColorResult(error=ValueError(f"Unexpected array shape {ar.shape}."))
 
         shape = ar.shape
-        # Reshape correctly
         ar_reshaped = ar.reshape(prod(shape[:2]), shape[2]).astype(float)
 
-        # Check if reshaped array is empty after potential filtering/conversion issues
         if ar_reshaped.shape[0] == 0:
-            logger.warning("Image array is empty after reshape. Returning empty palette.")
-            return []
+            return ColorResult(error=ValueError("Image array is empty after reshape."))
 
-        # Use more robust KMeans settings
-        n_clusters_desired = 5
         n_samples = ar_reshaped.shape[0]
-        n_clusters = min(n_clusters_desired, n_samples) # Cannot have more clusters than samples
+        n_clusters = min(KMEANS_CLUSTERS, n_samples)
 
-        if n_clusters == 0:
-            logger.warning("Not enough samples for clustering. Returning empty palette.")
-            return []
+        if n_clusters <= 0: # Changed check to <= 0
+            return ColorResult(error=ValueError("Not enough samples for clustering."))
 
         kmeans = MiniBatchKMeans(
             n_clusters=n_clusters,
             init="k-means++",
-            max_iter=100, # Increase iterations
+            max_iter=KMEANS_MAX_ITER,
             random_state=1000,
-            n_init=3, # Recommended to be >= 3
-            batch_size=1024, # Adjust based on expected image sizes/memory
-            max_no_improvement=10 # Stop early if no improvement
+            n_init=KMEANS_N_INIT,
+            batch_size=min(KMEANS_BATCH_SIZE, n_samples), # Prevent batch size > samples
+            max_no_improvement=KMEANS_MAX_NO_IMPROVEMENT,
+            compute_labels=True
         ).fit(ar_reshaped)
 
         codes = kmeans.cluster_centers_
-        vecs, _dist = cluster.vq.vq(ar_reshaped, codes)
-        counts, _bins = histogram(vecs, len(codes))
+        vecs = kmeans.labels_
 
-        # Filter out potential NaN or Inf values in codes before converting to int
+        counts, _bins = histogram(vecs, bins=range(n_clusters + 1))
+
+        # Filter out potential NaN or Inf values in codes
         valid_indices = [i for i, code in enumerate(codes) if all(c == c and abs(c) != float('inf') for c in code)]
-
         if not valid_indices:
-             logger.warning("No valid cluster centers found after filtering. Returning empty palette.")
-             return []
+             return ColorResult(error=ValueError("No valid cluster centers found after filtering."))
 
-        # Keep only valid codes and their corresponding counts
         codes = codes[valid_indices]
         counts = counts[valid_indices]
 
-        colors = []
-        # Sort remaining valid counts
+        dominant_colors_list: List[Tuple[int, int, int, int]] = []
         sorted_indices = argsort(counts)[::-1]
         for index in sorted_indices:
-            # Ensure color values are within valid range [0, 255] and are integers
-            color_rgb = tuple(max(0, min(255, int(round(c)))) for c in codes[index]) # Use round before int
-            # Append alpha channel (fully opaque)
-            colors.append(color_rgb + (255,))
+            color_rgb = tuple(max(0, min(255, int(round(c)))) for c in codes[index])
+            dominant_colors_list.append(color_rgb + (255,)) # Add alpha
 
-        if not colors:
-            logger.warning("No colors determined after processing clusters. Returning empty palette.")
-        return colors
+        if not dominant_colors_list:
+            return ColorResult(error=ValueError("No colors determined after processing clusters."))
+
+        return ColorResult(colors=dominant_colors_list)
 
     except Exception as e:
-        # Include traceback for errors in this function
-        logger.error(f"Error in dominant_colors: {e}", exc_info=True)
-        return [] # Return empty list on error
-
-
-# Unused functions remain below
-# def get_dominant_color(img: Image): ...
-# def hilo(a, b, c): ...
-# def complement(r, g, b): ...
+        logger.debug(f"Exception during dominant color extraction", exc_info=True)
+        return ColorResult(error=e)
 
 
 def main():
     processed_count = 0
-    skipped_count = 0
-    error_count = 0
-    data_dir = "data"
-    if not os.path.isdir(data_dir):
-        logger.error(f"Data directory '{data_dir}' not found. Exiting.")
+    failed_count = 0 # Renamed from error_count for clarity
+
+    if not os.path.isdir(DATA_DIR):
+        logger.error(f"Data directory '{DATA_DIR}' not found. Exiting.")
         return
 
-    logger.info(f"Starting image processing in directory: {data_dir}")
+    logger.info(f"Starting image processing in directory: {DATA_DIR}")
 
-    for root, _, files in walk(data_dir):
+    for root, _, files in walk(DATA_DIR):
         for file in files:
             # Case-insensitive check for extensions
-            if file.lower().endswith((".jpg", ".jpeg", ".tif", ".tiff", ".png")):
+            if file.lower().endswith(SUPPORTED_EXTENSIONS):
                 image_path = os.path.join(root, file)
-                logger.debug(f"Found image file: {image_path}")
-                # Modify process_image to return status: True (success), False (skipped), None (error)
-                # For now, just call it and handle exceptions here
-                try:
-                    # process_image now handles internal skips/errors and returns None
-                    process_image(image_path)
-                    # We can't easily count skips vs successes without modifying return value
-                    # Assume processed if no exception bubbles up
-                    processed_count += 1 # This count is approximate
-                except Exception as e:
-                    logger.error(f"Unhandled exception processing {image_path} in main loop: {e}", exc_info=True)
-                    error_count += 1
+                if process_image(image_path):
+                    processed_count += 1
+                else:
+                    failed_count += 1 # Count images that failed processing
 
-    logger.info(f"Processing complete. Approximate counts: Processed={processed_count}, Errors={error_count}.")
-    # Note: Skipped files due to EXIF errors are logged but not counted separately here.
+    logger.info(f"Processing complete. Successful: {processed_count}, Failed/Skipped: {failed_count}.")
 
 
 if __name__ == "__main__":
