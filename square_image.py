@@ -2,7 +2,7 @@ from PIL import Image
 from typing import Tuple
 
 
-def generate_final_image(
+def generate_squared_image(
     original_image: Image.Image,
     background_color: Tuple[int, int, int, int],
     canvas_padding: int,

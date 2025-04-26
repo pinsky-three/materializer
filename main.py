@@ -9,7 +9,8 @@ import logging
 import re # Import re for the original error context, though not used in fix
 import traceback # Import traceback for detailed error checking
 from typing import List, Tuple, Optional, NamedTuple, Any
-from square_image import generate_final_image
+# from square_image import generate_squared_image
+from materialize import materialize_image
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(asctime)s: %(message)s')
@@ -173,23 +174,28 @@ def save_image(image: Image.Image, source_path: str) -> bool:
         result_filename = os.path.splitext(os.path.basename(source_path))[0] + "_result.png"
         result_path = os.path.join(result_dir, result_filename)
 
-        os.makedirs(result_dir, exist_ok=True)
-        logger.info(f"Saving result to {result_path}")
-        image.save(result_path, format="PNG") # Explicitly specify format
-        return True # Indicate success
-
-    except ValueError: # Handles case where source_path might not be under DATA_DIR
+    except ValueError: 
         logger.warning(f"Could not determine relative path for {source_path} from '{DATA_DIR}'. Attempting to save in '{OUTPUT_DIR}' root.")
         try:
             result_filename = os.path.splitext(os.path.basename(source_path))[0] + "_result.png"
             result_path = os.path.join(OUTPUT_DIR, result_filename)
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            logger.info(f"Saving result to {result_path}")
-            image.save(result_path, format="PNG")
-            return True
+            result_dir = OUTPUT_DIR
         except Exception as e:
-            logger.error(f"Failed to save result for {source_path} even in root: {e}", exc_info=True)
-            return False
+             logger.error(f"Failed to construct fallback save path for {source_path}: {e}", exc_info=True)
+             return False
+
+    try:
+        os.makedirs(result_dir, exist_ok=True)
+        logger.info(f"Saving result to {result_path}")
+
+        # Ensure image is in RGBA mode before saving as PNG
+        if image.mode != 'RGBA':
+            logger.debug(f"Converting image from {image.mode} to RGBA before saving as PNG.")
+            image = image.convert('RGBA')
+
+        image.save(result_path, format="PNG")
+        return True
+
     except Exception as e:
         logger.error(f"Failed to save result {result_path}: {e}", exc_info=True)
         return False
@@ -233,7 +239,8 @@ def process_image(image_path: str) -> bool:
 
     # Step 3: Generate Final Image (using the pure function)
     try:
-        final_image = generate_final_image(image_to_process, background_color, CANVAS_PADDING, FINAL_PADDING)
+        # final_image = generate_squared_image(image_to_process, background_color, CANVAS_PADDING, FINAL_PADDING)
+        final_image = materialize_image(image_to_process, background_color, CANVAS_PADDING, FINAL_PADDING)
     except Exception as e:
         logger.error(f"Error during final image generation for {image_path}: {e}", exc_info=True)
         return False # Indicate failure if generation fails
