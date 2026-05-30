@@ -24,6 +24,4 @@ def materialize_image(
     
     img_sharped = curr_sharp.enhance(new_sharp) 
     
-     
-    
     return img_sharped
